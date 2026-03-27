@@ -1,0 +1,214 @@
+version: '3.8'
+
+x-airflow-common:
+  &airflow-common
+  build:
+    context: ./docker/airflow
+    dockerfile: Dockerfile
+  networks:
+    - airflow
+  environment:
+    &airflow-common-env
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__CELERY__BROKER_URL: redis://:@af_redis:6379/0
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@af_postgres/airflow
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__TEST_CONNECTION: Enabled
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@af_postgres/airflow
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 5
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 5
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+    DOCKER_HOST: unix:///var/run/docker.sock
+  volumes:
+    - ./workspace/dags:/opt/airflow/dags:rw
+    - ./workspace/dbt:/opt/airflow/dbt
+    - ./workspace/logs:/opt/airflow/logs
+    - ./workspace/shared_workers_data:/opt/airflow/shared_workers_data
+    - ./docker/airflow/plugins:/opt/airflow/plugins:rw
+    - /var/run/docker.sock:/var/run/docker.sock:rw
+  user: "${AIRFLOW_UID:-50000}:0"
+  group_add:
+    - "999"
+  depends_on:
+    &airflow-common-depends-on
+      af_redis:
+        condition: service_healthy
+      af_postgres:
+        condition: service_healthy
+
+services:
+  af_postgres:
+    image: postgres:17
+    container_name: af_postgres
+    hostname: af_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    mem_limit: 1G
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    networks:
+      - airflow
+
+  af_redis:
+    image: redis:7.2-bookworm
+    container_name: af_redis
+    hostname: af_redis
+    expose:
+      - 6379
+    mem_limit: 256M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - airflow
+
+  af_webserver:
+    <<: *airflow-common
+    container_name: af_webserver
+    hostname: af_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    mem_limit: 1G
+    cpus: 0.5
+
+  af_scheduler:
+    <<: *airflow-common
+    container_name: af_scheduler
+    hostname: af_scheduler
+    command: scheduler
+    mem_limit: 1G
+    cpus: 0.5
+
+  af_worker_spark:
+    <<: *airflow-common
+    container_name: af_worker_spark
+    hostname: af_worker_spark
+    command: celery worker -q spark_pool
+    mem_limit: 3G
+    cpus: 2
+
+  af_worker_default:
+    <<: *airflow-common
+    container_name: af_worker_default
+    hostname: af_worker_default
+    command: celery worker -q default
+    mem_limit: 2G
+    cpus: 1
+
+  af_flower:
+    <<: *airflow-common
+    container_name: af_flower
+    hostname: af_flower
+    command: celery flower
+    ports:
+      - "5555:5555"
+    mem_limit: 256M
+
+  clickhouse01:
+    image: clickhouse/clickhouse-server:25.5-alpine
+    container_name: clickhouse01
+    hostname: clickhouse01
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - ./docker/clickhouse/clickhouse01:/etc/clickhouse-server
+      - clickhouse01-data:/var/lib/clickhouse
+    mem_limit: 2G
+    cpus: 1
+    networks:
+      - airflow
+
+  clickhouse02:
+    image: clickhouse/clickhouse-server:25.5-alpine
+    container_name: clickhouse02
+    hostname: clickhouse02
+    ports:
+      - "8124:8123"
+    environment:
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - ./docker/clickhouse/clickhouse02:/etc/clickhouse-server
+      - clickhouse02-data:/var/lib/clickhouse
+    mem_limit: 2G
+    cpus: 1
+    networks:
+      - airflow
+
+  superset:
+    build: ./docker/bi-superset
+    container_name: superset
+    hostname: superset
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: your_secret_key
+      DATABASE_HOST: af_postgres
+      DATABASE_PORT: 5432
+      DATABASE_USER: airflow
+      DATABASE_PASSWORD: airflow
+      DATABASE_DB: airflow
+    depends_on:
+      af_postgres:
+        condition: service_healthy
+    mem_limit: 1G
+    cpus: 0.5
+    networks:
+      - airflow
+
+  jupyter:
+    build: ./docker/jupyter
+    container_name: jupyter
+    hostname: jupyter
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    environment:
+      SPARK_MASTER_URL: spark://192.168.0.1:7077   # замените на реальный IP
+    volumes:
+      - ./workspace/notebooks:/notebooks
+    mem_limit: 1.5G
+    cpus: 1
+    depends_on:
+      - clickhouse01
+      - clickhouse02
+    networks:
+      - airflow
+
+  dozzle:
+    image: amir20/dozzle:v8.13
+    container_name: monitoring
+    hostname: monitoring
+    ports:
+      - "8880:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    mem_limit: 256M
+    networks:
+      - airflow
+
+volumes:
+  postgres-data:
+  clickhouse01-data:
+  clickhouse02-data:
+
+networks:
+  airflow:
+    driver: bridge

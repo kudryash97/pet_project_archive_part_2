@@ -1,0 +1,130 @@
+version: '3.8'
+
+networks:
+  data_net:
+    driver: bridge
+
+services:
+  greenplum4seg:
+    build: docker/greenplum4seg
+    container_name: greenplum4seg
+    hostname: greenplum4seg
+    platform: linux/amd64
+    ports:
+      - "5433:5432"          # для доступа с Mac
+    environment:
+      GP_USER: gpadmin
+      GP_DATABASE: postgres
+    volumes:
+      - gpdb4seg-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+          cpus: '4'
+    networks:
+      - data_net
+
+  spark-master:
+    build: docker/spark
+    container_name: spark-master
+    hostname: spark-master
+    ports:
+      - "7077:7077"          # для подключения SparkSubmitOperator с Mac
+      - "9090:9090"          # веб-интерфейс
+    environment:
+      SPARK_MODE: master
+    volumes:
+      - ./docker/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+    mem_limit: 2G
+    cpus: 1
+    networks:
+      - data_net
+
+  spark-worker-1:
+    build: docker/spark
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+    volumes:
+      - ./docker/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+    mem_limit: 3G
+    cpus: 2
+    depends_on:
+      - spark-master
+    networks:
+      - data_net
+
+  spark-worker-2:
+    build: docker/spark
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+    volumes:
+      - ./docker/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+    mem_limit: 3G
+    cpus: 2
+    depends_on:
+      - spark-master
+    networks:
+      - data_net
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    hostname: minio
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    volumes:
+      - minio-data:/data
+    mem_limit: 1G
+    cpus: 0.5
+    networks:
+      - data_net
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: mssql
+    hostname: mssql
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserverdata:/var/opt/mssql
+    environment:
+      ACCEPT_EULA: Y
+      SA_PASSWORD: YourStrong!Passw0rd
+    mem_limit: 2G
+    cpus: 1
+    networks:
+      - data_net
+
+  postgres_extra:
+    image: postgres:17
+    container_name: postgres_extra
+    hostname: postgres_extra
+    ports:
+      - "5436:5432"
+    volumes:
+      - postgres_db_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+    mem_limit: 1G
+    cpus: 0.5
+    networks:
+      - data_net
+
+volumes:
+  gpdb4seg-data:
+  sqlserverdata:
+  minio-data:
+  postgres_db_data:
