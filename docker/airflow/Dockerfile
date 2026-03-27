@@ -47,6 +47,8 @@ RUN curl https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.2
 RUN pip install --upgrade pip
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
-RUN pip install --upgrade --no-cache-dir git+https://github.com/LexxaRRioo/opendbt.git@404f395
+RUN pip install --upgrade --no-cache-dir git+https://github.com/memiiso/opendbt.git@6d63fc0 \
+    && find /home/airflow/.local/lib -path "*/opendbt/catalog/__init__.py" \
+       -exec sed -i 's/from sqlglot import Expression/from sqlglot.expressions import Expression/' {} \;
 
 RUN pip install dotenv
