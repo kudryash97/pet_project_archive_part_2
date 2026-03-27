@@ -246,10 +246,10 @@ RUN mkdir -p /data/pxf /data/greenplum && \
 
 # Copy configuration scripts
 COPY --chown=gpadmin:gpadmin configure-logs.sh /configure-logs.sh
-RUN chmod +x /configure-logs.sh
+RUN sed -i 's/\r//' /configure-logs.sh && chmod +x /configure-logs.sh
 
 COPY --chown=gpadmin:gpadmin docker-entrypoint-pxf.sh /docker-entrypoint-pxf.sh
-RUN chmod +x /docker-entrypoint-pxf.sh
+RUN sed -i 's/\r//' /docker-entrypoint-pxf.sh && chmod +x /docker-entrypoint-pxf.sh
 
 # Declare persistent volumes
 VOLUME ["/data/greenplum", "/data/pxf"]

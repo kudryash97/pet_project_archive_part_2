@@ -116,7 +116,7 @@ RUN chmod +x /configure-logs.sh
 
 # Copy custom entrypoint
 COPY --chown=gpadmin:gpadmin docker-entrypoint-pxf.sh /docker-entrypoint-pxf.sh
-RUN chmod +x /docker-entrypoint-pxf.sh
+RUN sed -i 's/\r//' /docker-entrypoint-pxf.sh && chmod +x /docker-entrypoint-pxf.sh
 
 # Declare persistent volumes
 VOLUME ["/data/greenplum", "/data/pxf"]
