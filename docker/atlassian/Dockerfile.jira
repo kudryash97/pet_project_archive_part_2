@@ -1,0 +1,8 @@
+FROM teamatldocker/jira:8.22.4
+USER root
+
+# Add agent file
+COPY atlassian-agent.jar /opt/atlassian/jira/
+
+# Add agent to env
+RUN echo 'export CATALINA_OPTS="-javaagent:/opt/atlassian/jira/atlassian-agent.jar ${CATALINA_OPTS}"' >> /opt/jira/bin/setenv.sh

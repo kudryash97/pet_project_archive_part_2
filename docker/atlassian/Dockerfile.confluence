@@ -1,0 +1,8 @@
+FROM teamatldocker/confluence:7.11.0
+USER root
+
+# Add agent to env
+COPY atlassian-agent.jar /opt/atlassian/confluence/
+
+# Set Startup Loading Agent Package
+RUN echo 'export CATALINA_OPTS="-javaagent:/opt/atlassian/confluence/atlassian-agent.jar ${CATALINA_OPTS}"' >> /opt/atlassian/confluence/bin/setenv.sh

@@ -1,0 +1,1057 @@
+x-airflow-common:
+  &airflow-common
+  build:
+    context: ./docker/airflow
+    dockerfile: Dockerfile
+  networks:
+    - airflow
+  environment:
+    &airflow-common-env
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__CELERY__BROKER_URL: redis://:@af_redis:6379/0
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:${_AIRFLOW_WWW_USER_PASSWORD}@af_postgres/airflow
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__TEST_CONNECTION: Enabled
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${_AIRFLOW_WWW_USER_PASSWORD}@af_postgres/airflow
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 5
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 5
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+    DOCKER_HOST: unix:///var/run/docker.sock
+  volumes:
+    - ./workspace/dags:/opt/airflow/dags:rw
+    - ./workspace/dbt:/opt/airflow/dbt
+    - ./workspace/logs:/opt/airflow/logs
+    - ./workspace/shared_workers_data:/opt/airflow/shared_workers_data
+    - ./docker/airflow/plugins:/opt/airflow/plugins:rw
+    - /var/run/docker.sock:/var/run/docker.sock:rw
+  user: "${AIRFLOW_UID:-50000}:0"
+  group_add:
+    - "999"
+  depends_on:
+    &airflow-common-depends-on
+      af_redis:
+        condition: service_healthy
+      af_postgres:
+        condition: service_healthy
+
+x-clickhouse-common:
+  &clickhouse-common
+  image: clickhouse/clickhouse-server:25.5-alpine
+  networks:
+    - airflow
+  environment:
+    CLICKHOUSE_USER: clickhouse
+    CLICKHOUSE_PASSWORD: clickhouse
+  depends_on:
+    - zookeeper
+  mem_reservation: "256M"
+  mem_limit: "3G"
+  cpus: "2"
+  healthcheck:
+    test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+  # I/O limits for ClickHouse nodes (4 nodes share ~80MB/s write, 120MB/s read)
+  blkio_config:
+    weight: 700
+    device_write_bps:
+      - path: /dev/vda
+        rate: 20mb
+    device_read_bps:
+      - path: /dev/vda
+        rate: 30mb
+
+x-spark-worker-common-env:
+  &spark-worker-common-env
+  SPARK_PUBLIC_DNS: "spark.rzvde.pro"
+  SPARK_MASTER_URL: spark://spark-master:7077
+  SPARK_MODE: "worker"
+  SPARK_WORKER_MEMORY: "3g"
+  SPARK_WORKER_CORES: 2
+  SPARK_DAEMON_JAVA_OPTS: "-XX:+UseG1GC -XX:MaxGCPauseMillis=20 -Dspark.worker.cleanup.enabled=true"
+
+x-spark-worker-common:
+  &spark-worker-common
+  profiles: ["all", "spark"]
+  build:
+    context: ./docker/spark
+    dockerfile: Dockerfile
+  volumes:
+    - ./docker/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+  networks:
+    - airflow
+  mem_reservation: "1.5G"
+  mem_limit: "3G"
+  cpus: "2"
+  depends_on:
+    - spark-master
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8081/"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
+
+services:
+  af_postgres:
+    image: postgres:17
+    profiles: ["all","airflow"]
+    container_name: af_postgres
+    hostname: af_postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - af-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    mem_reservation: "512M"
+    mem_limit: "2G"
+    cpus: 1
+    networks:
+      - airflow
+    # I/O limits for Airflow PostgreSQL
+    blkio_config:
+      weight: 600
+      device_write_bps:
+        - path: /dev/vda
+          rate: 30mb
+      device_read_bps:
+        - path: /dev/vda
+          rate: 40mb
+
+  af_redis:
+    image: redis:7.2-bookworm
+    profiles: ["all","airflow"]
+    container_name: af_redis
+    hostname: af_redis
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    mem_reservation: "256M"
+    mem_limit: "512M"
+    cpus: 0.5
+    networks:
+      - airflow
+
+  af_webserver:
+    profiles: ["all","airflow"]
+    container_name: af_webserver
+    hostname: af_webserver
+    <<: *airflow-common
+    command: webserver
+    # ports:
+    #   - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_reservation: "1G"
+    mem_limit: "2G"
+    cpus: 1
+    # depends_on:
+    #   <<: *airflow-common-depends-on
+    #   af_init:
+    #     condition: service_completed_successfully
+
+  af_scheduler:
+    profiles: ["all","airflow"]
+    container_name: af_scheduler
+    hostname: af_scheduler
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_reservation: "1.5G"
+    mem_limit: "3G"
+    cpus: 3
+    # depends_on:
+    #   <<: *airflow-common-depends-on
+    #   af_init:
+    #     condition: service_completed_successfully
+
+  af_worker_0:
+    profiles: ["all","airflow"]
+    container_name: af_worker_0
+    hostname: af_worker_0
+    <<: *airflow-common
+    command: celery worker -q spark_pool,default
+    healthcheck:
+      # yamllint disable rule:line-length
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    mem_reservation: "4G"
+    mem_limit: "8G"
+    cpus: 8
+    # I/O limits for heavy Airflow worker (Spark jobs)
+    blkio_config:
+      weight: 700
+      device_write_bps:
+        - path: /dev/vda
+          rate: 40mb
+      device_read_bps:
+        - path: /dev/vda
+          rate: 50mb
+    # depends_on:
+    #   <<: *airflow-common-depends-on
+      # af_init:
+      #   condition: service_completed_successfully
+
+  af_worker_1:
+    profiles: ["all","airflow"]
+    container_name: af_worker_1
+    hostname: af_worker_1
+    <<: *airflow-common
+    command: celery worker -q default
+    healthcheck:
+      # yamllint disable rule:line-length
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      # Required to handle warm shutdown of the celery workers properly
+      # See https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
+      DUMB_INIT_SETSID: "0"
+    mem_reservation: "2G"
+    mem_limit: "4G"
+    cpus: 4
+    # I/O limits for regular Airflow worker
+    blkio_config:
+      weight: 500
+      device_write_bps:
+        - path: /dev/vda
+          rate: 25mb
+      device_read_bps:
+        - path: /dev/vda
+          rate: 30mb
+    # depends_on:
+    #   <<: *airflow-common-depends-on
+    #   af_init:
+    #     condition: service_completed_successfully
+
+  af_triggerer:
+    profiles: ["all","airflow"]
+    container_name: af_triggerer
+    hostname: af_triggerer
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_reservation: "256M"
+    mem_limit: "2G"
+    cpus: 1
+    # depends_on:
+    #   <<: *airflow-common-depends-on
+    #   af_init:
+    #     condition: service_completed_successfully
+
+  # af_init:
+  #   profiles: ["all","airflow"]
+  #   container_name: af_init
+  #   <<: *airflow-common
+  #   entrypoint: /bin/bash
+  #   # yamllint disable rule:line-length
+  #   command:
+  #     - -c
+  #     - |
+  #       if [[ -z "${AIRFLOW_UID}" ]]; then
+  #         echo
+  #         echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
+  #         echo "If you are on Linux, you SHOULD follow the instructions below to set "
+  #         echo "AIRFLOW_UID environment variable, otherwise files will be owned by root."
+  #         echo "For other operating systems you can get rid of the warning with manually created .env file:"
+  #         echo "    See: https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#setting-the-right-airflow-user"
+  #         echo
+  #       fi
+  #       one_meg=1048576
+  #       mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+  #       cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+  #       disk_available=$$(df / | tail -1 | awk '{print $$4}')
+  #       warning_resources="false"
+  #       if (( mem_available < 4000 )) ; then
+  #         echo
+  #         echo -e "\033[1;33mWARNING!!!: Not enough memory available for Docker.\e[0m"
+  #         echo "At least 4GB of memory required. You have $$(numfmt --to iec $$((mem_available * one_meg)))"
+  #         echo
+  #         warning_resources="true"
+  #       fi
+  #       if (( cpus_available < 2 )); then
+  #         echo
+  #         echo -e "\033[1;33mWARNING!!!: Not enough CPUS available for Docker.\e[0m"
+  #         echo "At least 2 CPUs recommended. You have $${cpus_available}"
+  #         echo
+  #         warning_resources="true"
+  #       fi
+  #       if (( disk_available < one_meg * 10 )); then
+  #         echo
+  #         echo -e "\033[1;33mWARNING!!!: Not enough Disk space available for Docker.\e[0m"
+  #         echo "At least 10 GBs recommended. You have $$(numfmt --to iec $$((disk_available * 1024 )))"
+  #         echo
+  #         warning_resources="true"
+  #       fi
+  #       if [[ $${warning_resources} == "true" ]]; then
+  #         echo
+  #         echo -e "\033[1;33mWARNING!!!: You have not enough resources to run Airflow (see above)!\e[0m"
+  #         echo "Please follow the instructions to increase amount of resources available:"
+  #         echo "   https://airflow.apache.org/docs/apache-airflow/stable/howto/docker-compose/index.html#before-you-begin"
+  #         echo
+  #       fi
+  #       mkdir -p /sources/workspace/dags
+  #       chown -R "${AIRFLOW_UID}:0" /sources/workspace/dags
+  #       exec /entrypoint airflow version
+  #   # yamllint enable rule:line-length
+  #   environment:
+  #     <<: *airflow-common-env
+  #     _AIRFLOW_DB_MIGRATE: 'true'
+  #     _AIRFLOW_WWW_USER_CREATE: 'true'
+  #     _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+  #     _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+  #     _PIP_ADDITIONAL_REQUIREMENTS: ''
+  #   user: "0:0"
+  #   volumes:
+  #     - ${AIRFLOW_PROJ_DIR:-.}:/sources
+
+  af_flower:
+    profiles: ["all","airflow"]
+    container_name: af_flower
+    <<: *airflow-common
+    command: celery flower
+    # ports:
+    #   - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_reservation: "128M"
+    mem_limit: "256M"
+    cpus: 0.5
+    # depends_on:
+    #   <<: *airflow-common-depends-on
+    #   af_init:
+    #     condition: service_completed_successfully
+
+  greenplum4seg:
+    profiles: ["all"]
+    build:
+      context: docker/greenplum4seg
+      dockerfile: Dockerfile
+      args:
+        SEGMENT_COUNT: 4
+    container_name: greenplum4seg
+    hostname: greenplum4seg
+    platform: linux/amd64
+    ports:
+      - "5433:5432"
+      - "5888:5888"
+    environment:
+      GP_USER: gpadmin
+      GP_DATABASE: postgres
+      PXF_JVM_OPTS: "-Xmx512m -Xms256m"
+    volumes:
+      - gpdb4seg-data:/data
+      - ./docker/greenplum4seg/pxf/conf:/data/pxf/conf
+      - ./docker/greenplum4seg/pxf/servers:/data/pxf/servers
+    deploy:
+      resources:
+        limits:
+          cpus: '10'
+          memory: 20G
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/local/gpdb/bin/pg_isready -h localhost -p 5432 -U gpadmin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  greenplum:
+    profiles: ["all"]
+    build:
+      context: docker/greenplum
+      dockerfile: Dockerfile
+    container_name: greenplum
+    hostname: greenplum
+    platform: linux/amd64
+    ports:
+      - "5430:5432"
+      - "5889:5888"
+    environment:
+      GP_USER: gpadmin
+      GP_DATABASE: postgres
+      PXF_JVM_OPTS: "-Xmx512m -Xms256m"
+    volumes:
+      - gpdb-data:/data
+      - ./docker/greenplum/pxf/conf:/data/pxf/conf
+      - ./docker/greenplum/pxf/servers:/data/pxf/servers
+    deploy:
+      resources:
+        limits:
+          cpus: '10'
+          memory: 20G
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/local/gpdb/bin/pg_isready -h localhost -p 5432 -U gpadmin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    # I/O limits for Greenplum (highest priority database)
+    blkio_config:
+      weight: 900
+      device_write_bps:
+        - path: /dev/vda
+          rate: 100mb
+      device_read_bps:
+        - path: /dev/vda
+          rate: 150mb
+
+  zookeeper:
+    image: zookeeper:3.7
+    profiles: ["all"]
+    container_name: zookeeper
+    hostname: zookeeper
+    networks:
+      - airflow
+    volumes:
+      - ./docker/zookeeper/config/zoo.cfg:/conf/zoo.cfg:ro
+    environment:
+      ZOO_CONF_DIR: /conf
+      ZOO_AUTOPURGE_PURGEINTERVAL: 1
+      ZOO_AUTOPURGE_SNAPRETAINCOUNT: 3
+    healthcheck:
+      test: ["CMD", "zkServer.sh", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_reservation: "256M"
+    mem_limit: "512M"
+    cpus: "0.5"
+    # I/O limits optimized for 372GB non-replicated SSD (328MB/s write, 440MB/s read)
+    blkio_config:
+      weight: 600
+      device_write_bps:
+        - path: /dev/vda
+          rate: 25mb
+      device_read_bps:
+        - path: /dev/vda
+          rate: 30mb
+
+  clickhouse01:
+    <<: *clickhouse-common
+    profiles: ["all"]
+    container_name: clickhouse01
+    hostname: clickhouse01
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ./docker/clickhouse/clickhouse01:/etc/clickhouse-server
+      - clickhouse01-data:/var/lib/clickhouse
+
+  clickhouse02:
+    <<: *clickhouse-common
+    profiles: ["all"]
+    container_name: clickhouse02
+    hostname: clickhouse02
+    ports:
+      - "8124:8123"
+    volumes:
+      - ./docker/clickhouse/clickhouse02:/etc/clickhouse-server
+      - clickhouse02-data:/var/lib/clickhouse
+
+  clickhouse03:
+    <<: *clickhouse-common
+    profiles: ["all"]
+    container_name: clickhouse03
+    hostname: clickhouse03
+    ports:
+      - "8125:8123"
+    volumes:
+      - ./docker/clickhouse/clickhouse03:/etc/clickhouse-server
+      - clickhouse03-data:/var/lib/clickhouse
+
+  clickhouse04:
+    <<: *clickhouse-common
+    profiles: ["all"]
+    container_name: clickhouse04
+    hostname: clickhouse04
+    ports:
+      - "8126:8123"
+    volumes:
+      - ./docker/clickhouse/clickhouse04:/etc/clickhouse-server
+      - clickhouse04-data:/var/lib/clickhouse
+
+  superset_redis:
+    image: redis:7.2-bookworm
+    profiles: ["all"]
+    container_name: superset_redis
+    hostname: superset_redis
+    networks:
+      - airflow
+    mem_reservation: "64M"
+    mem_limit: "128M"
+    cpus: "0.25"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  superset:
+    build:
+      context: ./docker/bi-superset
+      dockerfile: Dockerfile
+    profiles: ["all"]
+    container_name: superset
+    hostname: superset
+    networks:
+      - airflow
+    # ports:
+    #   - "9999:8088"
+    environment:
+      - SUPERSET_SECRET_KEY=your_secret_key_here
+      - DATABASE_DIALECT=postgresql
+      - DATABASE_USER=airflow
+      - DATABASE_PASSWORD=${_AIRFLOW_WWW_USER_PASSWORD}
+      - DATABASE_HOST=af_postgres
+      - DATABASE_PORT=5432
+      - DATABASE_DB=airflow
+      - REDIS_HOST=superset_redis
+      - REDIS_PORT=6379
+      - SQLALCHEMY_DATABASE_URI='postgresql://airflow:${_AIRFLOW_WWW_USER_PASSWORD}@af_postgres:5432/airflow?options=-csearch_path%3Dsuperset'
+    volumes:
+      - ./docker/bi-superset/superset_config.py:/app/pythonpath/superset_config.py
+    depends_on:
+      af_postgres:
+        condition: service_healthy
+      superset_redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    mem_reservation: "512M"
+    mem_limit: "1G"
+    cpus: "1"
+    command:
+      - bash
+      - -c
+      - |
+        PGPASSWORD=${_AIRFLOW_WWW_USER_PASSWORD} psql -h af_postgres -U airflow -d airflow -c 'CREATE SCHEMA IF NOT EXISTS superset;' &&
+        
+        # Clean up and recreate admin user
+        superset shell << 'EOF'
+        from superset import db
+        from flask_appbuilder.security.sqla.models import User
+        admin_user = db.session.query(User).filter_by(username='admin').first()
+        if admin_user:
+            db.session.delete(admin_user)
+            db.session.commit()
+            print("Existing admin user deleted")
+        exit()
+        EOF
+        
+        superset fab create-admin \
+                --username admin \
+                --firstname Superset \
+                --lastname Admin \
+                --email admin@localhost \
+                --password admin
+        superset db upgrade
+        superset init
+        superset run -h 0.0.0.0 -p 8088 --with-threads --reload --debugger
+
+  spark-master:
+    profiles: ["all", "spark"]
+    container_name: spark-master
+    hostname: spark-master
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    environment:
+      SPARK_MASTER_WEBUI_PORT: 9090
+      SPARK_PUBLIC_DNS: "spark.rzvde.pro"
+      SPARK_MODE: "master"
+      SPARK_DAEMON_MEMORY: "2g"
+      SPARK_DAEMON_JAVA_OPTS: "-XX:+UseG1GC -XX:MaxGCPauseMillis=20"
+      SPARK_EXECUTOR_MEMORY: "2g"
+      SPARK_DRIVER_MEMORY: "4g"
+      SPARK_EXECUTOR_CORES: 1
+      SPARK_DEFAULT_PARALLELISM: 4
+    volumes:
+      - ./docker/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+    ports:
+      - 9090:9090
+    #   - 7077:7077
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9090" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - airflow
+    mem_reservation: "2G"
+    mem_limit: "4G"
+    cpus: "2"
+
+  # spark-connect:
+  #   profiles: ["all", "spark"]
+  #   container_name: spark-connect
+  #   hostname: spark-connect
+  #   build:
+  #     context: ./docker/spark
+  #     dockerfile: Dockerfile
+  #   ports:
+  #     - "4041:4041"    # Connect UI port
+  #     - "15002:15002"  # Connect gRPC port
+  #   environment:
+  #     - SPARK_MASTER_URL=spark://spark-master:7077
+  #     - SPARK_DRIVER_HOST=0.0.0.0
+  #     - SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
+  #     - SPARK_PUBLIC_DNS=spark.rzvde.pro
+  #   volumes:
+  #     - ./docker/spark/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+  #   command:
+  #     - "bash"
+  #     - "-c"
+  #     - |
+  #       ./sbin/start-connect-server.sh \
+  #         --master spark://spark-master:7077 \
+  #         --conf spark.cores.max=4 \
+  #         --conf spark.executor.instances=2 \
+  #         --conf spark.executor.cores=2 \
+  #         --conf spark.executor.memory=3g \
+  #         --conf spark.driver.memory=2g \
+  #         --conf spark.app.name="SparkConnectServer" \
+  #         --conf spark.sql.connect.grpc.binding.port=15002 \
+  #         --conf spark.sql.connect.grpc.binding.host=0.0.0.0 \
+  #         --conf spark.ui.port=4041 \
+  #         --packages org.apache.spark:spark-connect_2.12:3.5.0 && \
+  #       tail -f /dev/null
+  #   # healthcheck:
+  #   #   test: [ "CMD", "curl", "-f", "http://localhost:9090" ]
+  #   #   interval: 5s
+  #   #   timeout: 3s
+  #   #   retries: 3
+  #   #   start_period: 10s
+  #   networks:
+  #     - airflow
+  #   mem_reservation: "1G"
+  #   mem_limit: "4G"
+  #   cpus: "2"
+  #   depends_on:
+  #     - spark-master
+
+  spark_worker_a:
+    <<: *spark-worker-common
+    container_name: spark_worker_a
+    hostname: spark_worker_a
+    environment:
+      <<: *spark-worker-common-env
+      SPARK_WORKER_WEBUI_PORT: 9091
+    ports:
+      - 9091:9091
+
+  spark_worker_b:
+    <<: *spark-worker-common
+    container_name: spark_worker_b
+    hostname: spark_worker_b
+    environment:
+      <<: *spark-worker-common-env
+      SPARK_WORKER_WEBUI_PORT: 9092
+    ports:
+      - 9092:9092
+
+  spark_worker_c:
+    <<: *spark-worker-common
+    container_name: spark_worker_c
+    hostname: spark_worker_c
+    environment:
+      <<: *spark-worker-common-env
+      SPARK_WORKER_WEBUI_PORT: 9093
+    ports:
+      - 9093:9093
+
+  spark_worker_d:
+    <<: *spark-worker-common
+    container_name: spark_worker_d
+    hostname: spark_worker_d
+    environment:
+      <<: *spark-worker-common-env
+      SPARK_WORKER_WEBUI_PORT: 9094
+    ports:
+      - 9094:9094
+
+  jupyter:
+    profiles: ["all"]
+    container_name: jupyter
+    hostname: jupyter
+    build:
+      context: ./docker/jupyter
+      dockerfile: Dockerfile
+    command: jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --NotebookApp.token="" --NotebookApp.password=""
+    ports:
+      - "4040:4040"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_DRIVER_HOST=0.0.0.0
+      - SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
+      - SPARK_PUBLIC_DNS=spark.rzvde.pro
+      - SPARK_UI_PORT=4040
+    volumes:
+      - ./workspace/notebooks:/notebooks
+      - ./workspace/jupyter_home:/home/jupyter_user  # Persist jupyter config
+    working_dir: /notebooks
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/api/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - airflow
+    mem_reservation: "768M"
+    mem_limit: "1.5G"
+    cpus: "1"
+    depends_on:
+      - spark-master
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # https://github.com/guywiththecrack/jira-crack # use only for testing purposes, buy license later!
+  confluence:
+    build:
+      context: ./docker/atlassian
+      dockerfile: Dockerfile.confluence
+    profiles: ["all"]
+    container_name: confluence
+    hostname: confluence
+    restart: unless-stopped
+    networks:
+      - airflow
+    volumes:
+      - confluence-data:/var/atlassian/confluence
+    ports:
+    #   - '82:8090'
+      - '8091:8091'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://confluence:8090/status"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      - 'CATALINA_OPTS= -Xms512m -Xmx1536m -XX:+UseG1GC'
+      - 'CONFLUENCE_PROXY_NAME='
+      - 'CONFLUENCE_PROXY_PORT='
+      - 'CONFLUENCE_PROXY_SCHEME='
+      - 'CONFLUENCE_DELAYED_START='
+    mem_reservation: "768M"
+    mem_limit: "4G"
+    cpus: "2"
+    depends_on:
+      - conf-postgresql
+  conf-postgresql:
+    image: postgres:9.5-alpine
+    profiles: ["all"]
+    container_name: conf-postgresql
+    hostname: conf-postgresql
+    networks:
+      - airflow
+    ports:
+      - "5434:5432"
+    volumes:
+      - cf-postgresql-data:/var/lib/postgresql/data
+    environment:
+      - 'POSTGRES_USER=confluencedb'
+      - 'POSTGRES_PASSWORD=jellyfish'
+      - 'POSTGRES_DB=confluencedb'
+      - 'POSTGRES_ENCODING=UTF8'
+      - 'POSTGRES_COLLATE=C'
+      - 'POSTGRES_COLLATE_TYPE=C'
+    mem_reservation: "512M"
+    mem_limit: "1G"
+    cpus: "0.5"
+    # I/O limits for Confluence PostgreSQL
+    blkio_config:
+      weight: 400
+      device_write_bps:
+        - path: /dev/vda
+          rate: 10mb
+      device_read_bps:
+        - path: /dev/vda
+          rate: 15mb
+
+  jira:
+    depends_on:
+      - jira-postgresql
+    profiles: ["all"]
+    container_name: jira
+    hostname: jira
+    restart: unless-stopped
+    build:
+      context: ./docker/atlassian
+      dockerfile: Dockerfile.jira
+    networks:
+      - airflow
+    volumes:
+      - jira-data:/var/atlassian/jira
+    # ports:
+    #   - '81:8080'
+    environment:
+      - 'JIRA_DATABASE_URL=postgresql://jira@jira-postgresql/jiradb'
+      - 'JIRA_DB_PASSWORD=jellyfish'
+      - 'SETENV_JVM_MINIMUM_MEMORY=1536m'
+      - 'SETENV_JVM_MAXIMUM_MEMORY=2560m'
+      - 'JIRA_PROXY_NAME='
+      - 'JIRA_PROXY_PORT='
+      - 'JIRA_PROXY_SCHEME='
+      # admin
+      # password
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://jira:8080/status"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    mem_reservation: "1.5G"
+    mem_limit: "4G"
+    cpus: "2"
+    logging:
+      # limit logs retained on host to 25MB
+      driver: "json-file"
+      options:
+        max-size: "500k"
+        max-file: "50"
+
+  jira-postgresql:
+    image: postgres:9.5-alpine
+    profiles: ["all"]
+    container_name: jira-postgresql
+    hostname: jira-postgresql
+    networks:
+      - airflow
+    ports:
+      - "5435:5432"
+    volumes:
+      - jr-postgresql-data:/var/lib/postgresql/data
+    environment:
+      - 'POSTGRES_USER=jira'
+      - 'POSTGRES_PASSWORD=jellyfish'
+      - 'POSTGRES_DB=jiradb'
+      - 'POSTGRES_ENCODING=UNICODE'
+      - 'POSTGRES_COLLATE=C'
+      - 'POSTGRES_COLLATE_TYPE=C'
+    mem_reservation: "512M"
+    mem_limit: "1G"
+    cpus: "0.5"
+    # I/O limits for Jira PostgreSQL
+    blkio_config:
+      weight: 400
+      device_write_bps:
+        - path: /dev/vda
+          rate: 10mb
+      device_read_bps:
+        - path: /dev/vda
+          rate: 15mb
+    logging:
+      # limit logs retained on host to 25MB
+      driver: "json-file"
+      options:
+        max-size: "500k"
+        max-file: "50"
+
+  nginx:
+    image: nginx:alpine
+    profiles: ["all"]
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./docker/nginx/certbot/conf:/etc/letsencrypt:ro
+      - ./docker/nginx/certbot/www:/var/www/certbot:ro
+    networks:
+      - airflow
+    depends_on:
+      - af_webserver
+      - superset
+      - jupyter
+      - af_flower
+      - spark-master
+      - spark_worker_a
+      - spark_worker_b
+      - spark_worker_c
+      - spark_worker_d
+      - monitoring
+      - gpskew
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "5"
+
+  monitoring:
+    image: amir20/dozzle:v8.13
+    profiles: ["all"]
+    container_name: monitoring
+    hostname: monitoring
+    environment:
+      - 'DOZZLE_ENABLE_ACTIONS=true'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - airflow
+    ports:
+      - 8880:8080
+    healthcheck:
+      test: ["CMD", "/dozzle", "healthcheck"]
+      interval: 3s
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+
+  jupyterhub:
+    profiles: ["all"]
+    container_name: jupyterhub
+    hostname: jupyterhub
+    build:
+      context: ./docker/jupyterhub
+      dockerfile: Dockerfile
+    environment:
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_DRIVER_HOST=0.0.0.0
+      - SPARK_DRIVER_BIND_ADDRESS=0.0.0.0
+      - SPARK_PUBLIC_DNS=spark.rzvde.pro
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - ./workspace/notebooks:/srv/workspace/notebooks:rw
+      - ./docker/jupyterhub/jupyterhub_config.py:/srv/jupyterhub/jupyterhub_config.py:ro
+    working_dir: /srv/jupyterhub
+    command: ["jupyterhub", "-f", "/srv/jupyterhub/jupyterhub_config.py"]
+    networks:
+      - airflow
+    mem_reservation: "512M"
+    mem_limit: "1G"
+    cpus: "1"
+
+  gpskew:
+    build:
+      context: ../distribution-partitioning-demo-webapp
+      dockerfile: Dockerfile
+    profiles: ["all"]
+    container_name: gpskew
+    restart: unless-stopped
+    networks:
+      - airflow
+    mem_reservation: "128M"
+    mem_limit: "512M"
+    cpus: "0.5"
+
+  certbot:
+    image: certbot/certbot
+    profiles: ["all"]
+    container_name: certbot
+    volumes:
+      - ./docker/nginx/certbot/conf:/etc/letsencrypt
+      - ./docker/nginx/certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+  # dbt-docs:
+  #   image: node:18-alpine
+  #   profiles: ["all"]
+  #   container_name: dbt_docs
+  #   working_dir: /app
+  #   command: |
+  #     sh -c "
+  #     npm install -g http-server &&
+  #     echo 'DBT docs will be served here when ready' > index.html &&
+  #     http-server -p 8000 --cors
+  #     "
+  # networks:
+  #   - airflow
+  #   mem_reservation: "64M"
+  #   mem_limit: "256M"
+  #   cpus: "0.25"
+
+volumes:
+  gpdb-data:
+    external: true
+  af-pg-data:
+    external: true
+  clickhouse01-data:
+    external: true
+  clickhouse02-data:
+    external: true
+  clickhouse03-data:
+    external: true
+  clickhouse04-data:
+    external: true
+  cf-postgresql-data:
+    external: true
+  confluence-data:
+    external: true
+  jr-postgresql-data:
+    external: true
+  jira-data:
+    external: true
+  gpdb4seg-data:
+    external: true
+
+networks:
+  airflow:
+    driver: bridge
+    attachable: true

@@ -1,0 +1,30 @@
+# jupyter/Dockerfile
+FROM bitnamilegacy/spark:3.5.0-debian-12-r18
+
+USER root
+
+RUN install_packages curl python3-pip \
+    && pip3 install --upgrade pip
+
+# Add the same Hadoop AWS and AWS SDK jars as your other containers
+RUN curl https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar \
+    --output /opt/bitnami/spark/jars/aws-java-sdk-bundle-1.12.262.jar \
+    && curl https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar \
+    --output /opt/bitnami/spark/jars/hadoop-aws-3.3.4.jar \
+    && curl https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.5/postgresql-42.7.5.jar \
+    --output /opt/bitnami/spark/jars/postgresql-42.7.5.jar
+
+# Create notebooks directory
+RUN mkdir -p /notebooks && chmod 777 /notebooks
+
+WORKDIR /notebooks
+
+# Set environment variables
+ENV SPARK_HOME=/opt/bitnami/spark
+ENV PATH=$SPARK_HOME/bin:$PATH
+ENV PYTHONPATH=$SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-0.10.9.7-src.zip:$PYTHONPATH
+ENV PYSPARK_PYTHON=python3
+ENV PYSPARK_DRIVER_PYTHON=python3
+
+COPY requirements.txt /app/requirements.txt
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
